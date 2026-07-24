@@ -11,6 +11,7 @@
 ## 特性
 
 - ✅ **消息接收** — WeFlow SSE 实时推送，无轮询无风控
+- ✅ **引用与 @** — 引用消息转换为 OneBot reply，支持多个机器人昵称别名
 - ✅ **AI 回复** — 通过 AstrBot 调用任何 LLM（DeepSeek、Kimi、Claude 等）
 - ✅ **图片识别** — 支持 ollama llava / Kimi 等模型描述图片内容
 - ✅ **三种群聊模式** — 仅@回复 / 全部回复 / 批处理，Web 页面一键切换
@@ -94,7 +95,7 @@ Web 控制面板：**http://127.0.0.1:8766**
 |------|------|
 | `weflow_base_url` | WeFlow API 地址，默认 `http://127.0.0.1:5031` |
 | `access_token` | WeFlow Access Token |
-| `bot_nicknames` | 机器人微信昵称列表，群聊 @ 检测用 |
+| `bot_nicknames` | 机器人微信昵称及群内 @ 别名，如 `["微信机器人", "Bot"]` |
 | `bot_wxid` | 机器人自己的 wxid（可选，防自回复） |
 | `send_method` | `"uia"`（UIA 自动化，推荐）或 `"weflow_api"` |
 | `buffer_seconds` | 消息缓冲秒数，多条消息合并后推送 |

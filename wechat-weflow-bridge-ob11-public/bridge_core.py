@@ -23,7 +23,7 @@ import requests
 
 import state
 import config
-from ob_protocol import push_event, make_message_event
+from ob_protocol import cache_message_event, make_message_event, push_event
 
 log = logging.getLogger("ob11-bridge")
 
@@ -41,6 +41,33 @@ def _route_name_is_ambiguous(
         and metadata.get("contact") == contact
         for other_id, metadata in state.list_route_metadata(kind)
     )
+
+
+_MENTION_SPACING = r"[\s\u2000-\u200f\u2028\u2029\u3000]*"
+_MENTION_BOUNDARY = r"(?=$|[\s\u2000-\u200f\u2028\u2029\u3000,，。！？!?：:])"
+
+
+def _bot_mention_pattern(nickname: str) -> re.Pattern:
+    return re.compile(
+        rf"@{_MENTION_SPACING}{re.escape(nickname)}{_MENTION_BOUNDARY}",
+        re.IGNORECASE,
+    )
+
+
+def _is_bot_mentioned(content: str) -> bool:
+    text = str(content or "")
+    return any(
+        nickname and _bot_mention_pattern(nickname).search(text)
+        for nickname in config.BOT_NICKNAMES
+    )
+
+
+def _strip_bot_mentions(content: str) -> str:
+    text = str(content or "")
+    for nickname in config.BOT_NICKNAMES:
+        if nickname:
+            text = _bot_mention_pattern(nickname).sub("", text)
+    return text.strip()
 
 
 class WeFlowBridge:
@@ -113,7 +140,7 @@ class WeFlowBridge:
 
         if is_group:
             is_command = any(content.lstrip().startswith(prefix) for prefix in config.COMMAND_PREFIXES)
-            is_mentioned = any(f"@{n}" in content for n in config.BOT_NICKNAMES)
+            is_mentioned = _is_bot_mentioned(content)
             if state.group_reply_mode == "mention" and not is_mentioned and not is_command:
                 return
             group_raw = (
@@ -154,8 +181,24 @@ class WeFlowBridge:
                     "sender_username": data.get("senderUsername", ""),
                     "sender_id": data.get("senderId", ""),
                     "session_id_data": session_id_data,
+                    "message_id": str(data.get("rawid", "") or ""),
+                    "reply": None,
                 }
             entry = self.pending_buffers[buffer_key]
+            entry["message_id"] = str(
+                data.get("rawid", "") or entry.get("message_id", "")
+            )
+            entry["sender_username"] = (
+                data.get("senderUsername", "")
+                or entry.get("sender_username", "")
+            )
+            reply_to_message_id = str(data.get("replyToMessageId", "") or "").strip()
+            quote = data.get("quote")
+            if reply_to_message_id and isinstance(quote, dict):
+                entry["reply"] = {
+                    "message_id": reply_to_message_id,
+                    "quote": dict(quote),
+                }
             if is_group and state.group_reply_mode == "batch" and sender_in_group:
                 entry["messages"].append(f'成员"{sender_in_group}"在群"{base_name}"中对你说：{content}')
             else:
@@ -185,6 +228,56 @@ class WeFlowBridge:
             ]
             for key in expired:
                 self._sent_recently.pop(key, None)
+
+    def _make_reply_segment(
+        self,
+        entry: dict,
+        is_group: bool,
+        group_id: int = 0,
+    ) -> dict | None:
+        reply = entry.get("reply")
+        if not isinstance(reply, dict):
+            return None
+
+        message_id = str(reply.get("message_id", "") or "").strip()
+        quote = reply.get("quote")
+        if not message_id.isdigit() or not isinstance(quote, dict):
+            return None
+
+        sender_key = str(quote.get("sender", "") or "").strip()
+        nickname = str(
+            quote.get("accountName", "")
+            or sender_key
+            or "未知成员"
+        )
+        if not sender_key:
+            sender_key = (
+                f"{entry.get('session_id_data', '')}_quoted_{nickname}"
+            )
+        sender_id = state._wxid_to_int(sender_key)
+        content = str(quote.get("content", "") or "[消息]")
+        quote_message = [{"type": "text", "data": {"text": content}}]
+
+        if is_group:
+            quote_event = make_message_event(
+                "group",
+                sender_id,
+                quote_message,
+                group_id=group_id,
+                group_name=entry.get("group_name", ""),
+                nickname=nickname,
+                message_id=message_id,
+            )
+        else:
+            quote_event = make_message_event(
+                "private",
+                sender_id,
+                quote_message,
+                nickname=nickname,
+                message_id=message_id,
+            )
+        cache_message_event(quote_event)
+        return {"type": "reply", "data": {"id": message_id}}
 
     def process_sender(self, sender_id, version=None):
         """缓冲到期：通过 OneBot 事件推送给 AstrBot。"""
@@ -230,11 +323,7 @@ class WeFlowBridge:
                 formatted = combined
             else:
                 # 去掉消息中的 @机器人 纯文本，换为 OneBot at 元素
-                clean_text = combined
-                for nick in config.BOT_NICKNAMES:
-                    at_pattern = f"@{nick}"
-                    if at_pattern in clean_text:
-                        clean_text = clean_text.replace(at_pattern, "").strip()
+                clean_text = _strip_bot_mentions(combined)
 
                 formatted = clean_text
                 is_command = any(
@@ -245,19 +334,33 @@ class WeFlowBridge:
                     formatted = f'{sender_name}在群{entry.get("group_name", contact)}中说：{clean_text}'
 
             # 消息段：先 at 机器人（让 aiocqhttp 识别为 @），再发文本
-            msg_segments = [
+            msg_segments = []
+            reply_segment = self._make_reply_segment(entry, True, group_id)
+            if reply_segment:
+                msg_segments.append(reply_segment)
+            msg_segments.extend([
                 {"type": "at", "data": {"qq": str(state._self_id_int)}},
                 {"type": "text", "data": {"text": f" {formatted}"}},
-            ]
+            ])
             event = make_message_event("group", user_id, msg_segments,
                                        group_id=group_id,
                                        group_name=entry.get("group_name", contact),
-                                       nickname=sender_name)
+                                       nickname=sender_name,
+                                       message_id=entry.get("message_id"))
         else:
             sender_name = entry.get("source_name", contact)
-            event = make_message_event("private", user_id,
-                                       [{"type": "text", "data": {"text": combined}}],
-                                       nickname=sender_name)
+            msg_segments = []
+            reply_segment = self._make_reply_segment(entry, False)
+            if reply_segment:
+                msg_segments.append(reply_segment)
+            msg_segments.append({"type": "text", "data": {"text": combined}})
+            event = make_message_event(
+                "private",
+                user_id,
+                msg_segments,
+                nickname=sender_name,
+                message_id=entry.get("message_id"),
+            )
 
         # 记录 user_id → contact 映射，供 API 回复时查找
         if is_group:

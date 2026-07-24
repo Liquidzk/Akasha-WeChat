@@ -891,7 +891,7 @@ class UiaSender(BaseSender):
             preview = self._get_mmui_session_preview(contact)
             if expected in preview and preview != previous:
                 return True
-            time.sleep(0.4)
+            time.sleep(0.2)
         return False
 
     def _send_mmui_image_via_file_dialog(
@@ -987,29 +987,39 @@ class UiaSender(BaseSender):
         else:
             open_button.Click()
 
-        if self._wait_mmui_preview(
+        # WeChat 4 normally opens an attachment preview after file selection.
+        # Click its Send button as soon as it appears instead of waiting for the
+        # session preview timeout first.
+        preview_deadline = time.time() + 3.0
+        while time.time() < preview_deadline:
+            preview = self._get_mmui_session_preview(contact)
+            if "[图片]" in preview and preview != previous_preview:
+                return True
+
+            send_button = self._find_mmui_control(
+                lambda control: (
+                    control.ControlTypeName == "ButtonControl"
+                    and control.ClassName == "mmui::XOutlineButton"
+                    and (control.Name or "").strip() == "发送"
+                )
+            )
+            if send_button:
+                if not self._post_mmui_click(send_button):
+                    return False
+                return self._wait_mmui_preview(
+                    contact,
+                    "[图片]",
+                    previous_preview,
+                    timeout=10.0,
+                )
+            time.sleep(0.15)
+
+        return self._wait_mmui_preview(
             contact,
             "[图片]",
             previous_preview,
-            timeout=12.0,
-        ):
-            return True
-
-        send_button = self._find_mmui_control(
-            lambda control: (
-                control.ControlTypeName == "ButtonControl"
-                and control.ClassName == "mmui::XOutlineButton"
-                and (control.Name or "").strip() == "发送"
-            )
+            timeout=8.0,
         )
-        if send_button and self._post_mmui_click(send_button):
-            return self._wait_mmui_preview(
-                contact,
-                "[图片]",
-                previous_preview,
-                timeout=12.0,
-            )
-        return False
 
     def _reset_input_cache(self) -> None:
         self._input_control = None
@@ -1023,6 +1033,7 @@ class UiaSender(BaseSender):
         timeout: float = 5.0,
     ) -> bool:
         deadline = time.time() + timeout
+        wrong_kind_observations = 0
         while time.time() < deadline:
             ready = []
 
@@ -1055,6 +1066,12 @@ class UiaSender(BaseSender):
                 current_is_group = self._current_mmui_is_group(contact)
                 if current_is_group is is_group:
                     return True
+                if current_is_group is not None:
+                    wrong_kind_observations += 1
+                    if wrong_kind_observations >= 2:
+                        return False
+                else:
+                    wrong_kind_observations = 0
             time.sleep(0.2)
         return False
 

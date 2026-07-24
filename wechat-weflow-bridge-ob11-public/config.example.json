@@ -4,7 +4,8 @@
     "access_token": "你的WeFlow_Access_Token",
     "astrbot_attachments": "C:\\astrbot\\data\\attachments",
     "bot_nicknames": [
-        "机器人昵称"
+        "机器人昵称",
+        "Bot"
     ],
     "bot_wxid": "机器人自己的wxid（可选，防自回复用）",
     "send_method": "uia",

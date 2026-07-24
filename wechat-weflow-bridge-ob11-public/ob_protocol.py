@@ -15,6 +15,8 @@ import os
 import tempfile
 import time
 import logging
+import threading
+from collections import OrderedDict
 from urllib.parse import unquote, urlparse
 
 import requests
@@ -23,6 +25,10 @@ import state
 import config
 
 log = logging.getLogger("ob11-bridge")
+
+_MESSAGE_CACHE_LIMIT = 10000
+_message_cache = OrderedDict()
+_message_cache_lock = threading.Lock()
 
 
 async def _handle_ob_api(data: dict):
@@ -50,6 +56,9 @@ async def _handle_ob_api(data: dict):
             })
         elif action in ("can_send_image", "can_send_record"):
             response = _ok({"yes": action == "can_send_image"})
+        elif action == "get_msg":
+            message = get_cached_message(params.get("message_id"))
+            response = _ok(message) if message else _failed("消息不存在或缓存已过期", 1404)
         elif action == "get_group_info":
             group_id = _as_int(params.get("group_id"))
             metadata = state.get_route_metadata(group_id)
@@ -222,6 +231,30 @@ def _as_int(value) -> int:
         return 0
 
 
+def cache_message_event(event: dict) -> None:
+    """Cache inbound OneBot events so AstrBot can resolve reply segments."""
+    message_id = str(event.get("message_id", "")).strip()
+    if not message_id:
+        return
+    with _message_cache_lock:
+        _message_cache[message_id] = dict(event)
+        _message_cache.move_to_end(message_id)
+        while len(_message_cache) > _MESSAGE_CACHE_LIMIT:
+            _message_cache.popitem(last=False)
+
+
+def get_cached_message(message_id) -> dict | None:
+    key = str(message_id or "").strip()
+    if not key:
+        return None
+    with _message_cache_lock:
+        event = _message_cache.get(key)
+        if event is None:
+            return None
+        _message_cache.move_to_end(key)
+        return dict(event)
+
+
 def _record_sent_message(content: str) -> None:
     bridge = state.bridge_instance
     if bridge and hasattr(bridge, "record_sent_message"):
@@ -302,12 +335,17 @@ def _extract_text(message: list) -> str:
 
 def make_message_event(message_type: str, user_id: int, message: list,
                        group_id: int = 0, group_name: str = "",
-                       nickname: str = "") -> dict:
+                       nickname: str = "", message_id=None) -> dict:
     """构造 OneBot v11 消息事件"""
     event = {
         "time": int(time.time()),
         "self_id": state._self_id_int,
         "post_type": "message",
+        "message_id": (
+            int(message_id)
+            if str(message_id or "").isdigit()
+            else int(time.time() * 1000)
+        ),
     }
     if message_type == "group":
         event["message_type"] = "group"
@@ -334,6 +372,7 @@ def make_message_event(message_type: str, user_id: int, message: list,
 
 def push_event(event: dict) -> bool:
     """通过 WebSocket 客户端连接向 AstrBot 推送事件。"""
+    cache_message_event(event)
     if not state._ob_ws or not state._ob_ws_loop:
         return False
     try:

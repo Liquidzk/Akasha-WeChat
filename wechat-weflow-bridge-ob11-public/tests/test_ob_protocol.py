@@ -28,6 +28,8 @@ class OneBotProtocolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         state._ob_id_to_contact.clear()
         state._ob_id_metadata.clear()
+        with ob_protocol._message_cache_lock:
+            ob_protocol._message_cache.clear()
         self.sender = FakeSender()
         state.sender_instance = self.sender
 
@@ -99,6 +101,22 @@ class OneBotProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1409, response["retcode"])
         self.assertIn("contact_overrides", response["message"])
         self.assertEqual([], self.sender.text_calls)
+
+    def test_message_event_uses_platform_message_id_and_is_cacheable(self):
+        event = ob_protocol.make_message_event(
+            "group",
+            456,
+            [{"type": "text", "data": {"text": "测试"}}],
+            group_id=123,
+            message_id="6116895530414915131",
+        )
+        ob_protocol.cache_message_event(event)
+
+        self.assertEqual(6116895530414915131, event["message_id"])
+        self.assertEqual(
+            event,
+            ob_protocol.get_cached_message("6116895530414915131"),
+        )
 
 
 if __name__ == "__main__":
