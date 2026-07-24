@@ -13,12 +13,14 @@ import state
 class FakeSender:
     def __init__(self):
         self.text_calls = []
+        self.target_kinds = []
 
-    def send_text(self, contact, text):
+    def send_text(self, contact, text, is_group=None):
         self.text_calls.append((contact, text))
+        self.target_kinds.append(is_group)
         return True
 
-    def send_image(self, contact, image_path):
+    def send_image(self, contact, image_path, is_group=None):
         return True
 
 
@@ -46,6 +48,7 @@ class OneBotProtocolTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual("ok", response["status"])
         self.assertEqual([("燕云测试群", "测试")], self.sender.text_calls)
+        self.assertEqual([True], self.sender.target_kinds)
 
     async def test_unknown_route_fails_without_sending(self):
         response = await ob_protocol._handle_send_api(

@@ -19,9 +19,19 @@ from config import WE_FLOW_SEND_API, ACCESS_TOKEN, SEND_METHOD
 
 class BaseSender:
     """消息发送器基类"""
-    def send_text(self, contact: str, text: str) -> bool:
+    def send_text(
+        self,
+        contact: str,
+        text: str,
+        is_group: bool | None = None,
+    ) -> bool:
         raise NotImplementedError
-    def send_image(self, contact: str, image_path: str) -> bool:
+    def send_image(
+        self,
+        contact: str,
+        image_path: str,
+        is_group: bool | None = None,
+    ) -> bool:
         raise NotImplementedError
 
 
@@ -31,7 +41,12 @@ class WeFlowApiSender(BaseSender):
         self.api_url = api_url
         self.access_token = access_token
 
-    def send_text(self, contact: str, text: str) -> bool:
+    def send_text(
+        self,
+        contact: str,
+        text: str,
+        is_group: bool | None = None,
+    ) -> bool:
         try:
             resp = requests.post(
                 self.api_url,
@@ -49,7 +64,12 @@ class WeFlowApiSender(BaseSender):
             log.error(f"[WeFlowSender] 请求异常: {e}")
             return False
 
-    def send_image(self, contact: str, image_path: str) -> bool:
+    def send_image(
+        self,
+        contact: str,
+        image_path: str,
+        is_group: bool | None = None,
+    ) -> bool:
         try:
             with open(image_path, "rb") as f:
                 files = {"image": f}

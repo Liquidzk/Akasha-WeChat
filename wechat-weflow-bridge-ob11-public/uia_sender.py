@@ -31,10 +31,20 @@ log = logging.getLogger("weflow-bridge")
 
 class BaseSender:
     """消息发送器基类"""
-    def send_text(self, contact: str, text: str) -> bool:
+    def send_text(
+        self,
+        contact: str,
+        text: str,
+        is_group: bool | None = None,
+    ) -> bool:
         raise NotImplementedError
 
-    def send_image(self, contact: str, image_path: str) -> bool:
+    def send_image(
+        self,
+        contact: str,
+        image_path: str,
+        is_group: bool | None = None,
+    ) -> bool:
         raise NotImplementedError
 
 
@@ -95,20 +105,255 @@ class UiaSender(BaseSender):
             log.info(f"微信窗口: '{self._window.Name}' ClassName={self._window.ClassName}")
             self._ready = True
 
+    @staticmethod
+    def _mmui_tree_available(window) -> bool:
+        found = []
+
+        def walk(control, depth=0):
+            if depth > 20 or found:
+                return
+            try:
+                if (
+                    (control.AutomationId or "") == "session_list"
+                    or control.ClassName == "mmui::ChatMasterView"
+                ):
+                    found.append(True)
+                    return
+                for child in control.GetChildren():
+                    walk(child, depth + 1)
+            except Exception:
+                pass
+
+        walk(window)
+        return bool(found)
+
+    def _restore_mmui_from_tray(self):
+        """从系统托盘恢复微信 4 主窗口。"""
+        import ctypes
+        from ctypes import wintypes
+
+        auto = self._auto
+        overflow_classes = {
+            "TopLevelWindowForOverflowXamlIsland",
+            "NotifyIconOverflowWindow",
+        }
+
+        def root_children():
+            return auto.GetRootControl().GetChildren()
+
+        def find_descendant(control, predicate, max_depth=12):
+            matches = []
+
+            def walk(item, depth=0):
+                if depth > max_depth or matches:
+                    return
+                try:
+                    if predicate(item):
+                        matches.append(item)
+                        return
+                    for child in item.GetChildren():
+                        walk(child, depth + 1)
+                except Exception:
+                    pass
+
+            walk(control)
+            return matches[0] if matches else None
+
+        def find_window():
+            for item in root_children():
+                if (
+                    item.ClassName == "mmui::MainWindow"
+                    and self._mmui_tree_available(item)
+                ):
+                    return item
+            return None
+
+        def wait_for_window(timeout=3.0):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                window = find_window()
+                if window:
+                    return window
+                time.sleep(0.2)
+            return None
+
+        def post_click(control):
+            hwnd = int(control.GetTopLevelControl().NativeWindowHandle or 0)
+            if not hwnd:
+                return
+            origin = wintypes.POINT(0, 0)
+            if not ctypes.windll.user32.ClientToScreen(
+                hwnd,
+                ctypes.byref(origin),
+            ):
+                return
+            rect = control.BoundingRectangle
+            x = int(rect.left + rect.width() / 2 - origin.x)
+            y = int(rect.top + rect.height() / 2 - origin.y)
+            lparam = (y << 16) | (x & 0xFFFF)
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0200, 0, lparam)
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0201, 1, lparam)
+            ctypes.windll.user32.PostMessageW(hwnd, 0x0202, 0, lparam)
+
+        children = root_children()
+        overflow_windows = [
+            item for item in children if item.ClassName in overflow_classes
+        ]
+        taskbars = [
+            item for item in children if item.ClassName == "Shell_TrayWnd"
+        ]
+        if not overflow_windows and taskbars:
+            hidden_button = find_descendant(
+                taskbars[0],
+                lambda item: (
+                    item.ControlTypeName == "ButtonControl"
+                    and (item.Name or "").strip()
+                    in {"显示隐藏的图标", "Show hidden icons"}
+                ),
+            )
+            if hidden_button:
+                invoke = hidden_button.GetInvokePattern()
+                if invoke:
+                    invoke.Invoke()
+                else:
+                    post_click(hidden_button)
+                time.sleep(1.0)
+                overflow_windows = [
+                    item
+                    for item in root_children()
+                    if item.ClassName in overflow_classes
+                ]
+
+        search_roots = [*overflow_windows, *taskbars]
+        weixin_icon = next(
+            (
+                icon
+                for root in search_roots
+                if (
+                    icon := find_descendant(
+                        root,
+                        lambda item: (
+                            item.ControlTypeName == "ButtonControl"
+                            and (item.Name or "").strip()
+                            in {"微信", "WeChat"}
+                        ),
+                    )
+                )
+            ),
+            None,
+        )
+        if not weixin_icon:
+            return None
+
+        invoke = weixin_icon.GetInvokePattern()
+        if invoke:
+            invoke.Invoke()
+            window = wait_for_window()
+            if window:
+                log.info("已从系统托盘恢复微信窗口")
+                return window
+
+        legacy = weixin_icon.GetLegacyIAccessiblePattern()
+        if legacy:
+            legacy.DoDefaultAction()
+            window = wait_for_window()
+            if window:
+                log.info("已从系统托盘恢复微信窗口")
+                return window
+
+        post_click(weixin_icon)
+        window = wait_for_window()
+        if window:
+            log.info("已从系统托盘恢复微信窗口")
+        return window
+
     def _find_window(self):
         """按标题搜索微信窗口"""
         auto = self._auto
         root = auto.GetRootControl()
+        candidates = []
         for w in root.GetChildren():
             cls = w.ClassName
             if cls in self.EXCLUDE_CLASSES:
                 continue
             for kw in self.WECHAT_TITLES:
                 if kw in w.Name:
-                    self._window = w
-                    if cls != "WeChatMainWndForPC":
-                        self._is_electron = True
-                    return
+                    if cls in {
+                        "mmui::MainWindow",
+                        "Qt51514QWindowIcon",
+                        "WeChatMainWndForPC",
+                    }:
+                        candidates.append(w)
+                    break
+        candidates = [
+            item
+            for item in candidates
+            if (
+                item.ClassName != "mmui::MainWindow"
+                or self._mmui_tree_available(item)
+            )
+        ]
+        if not candidates:
+            try:
+                import ctypes
+
+                hwnd = ctypes.windll.user32.FindWindowW(
+                    "mmui::MainWindow",
+                    None,
+                )
+                if hwnd:
+                    ctypes.windll.user32.ShowWindow(hwnd, 9)
+                    time.sleep(0.8)
+                    candidate = auto.ControlFromHandle(hwnd)
+                    if self._mmui_tree_available(candidate):
+                        candidates.append(candidate)
+            except Exception:
+                pass
+        if not candidates:
+            try:
+                restored = self._restore_mmui_from_tray()
+                if restored:
+                    candidates.append(restored)
+            except Exception as exc:
+                log.debug("从系统托盘恢复微信失败: %s", exc)
+        if not candidates:
+            try:
+                import ctypes
+
+                key_up = 0x0002
+                for virtual_key in (0x11, 0x12, 0x57):
+                    ctypes.windll.user32.keybd_event(
+                        virtual_key,
+                        0,
+                        0,
+                        0,
+                    )
+                for virtual_key in (0x57, 0x12, 0x11):
+                    ctypes.windll.user32.keybd_event(
+                        virtual_key,
+                        0,
+                        key_up,
+                        0,
+                    )
+                time.sleep(1.5)
+                candidates = [
+                    item
+                    for item in auto.GetRootControl().GetChildren()
+                    if item.ClassName == "mmui::MainWindow"
+                ]
+            except Exception:
+                pass
+        if not candidates:
+            self._window = None
+            return
+        self._window = max(
+            candidates,
+            key=lambda item: (
+                item.ClassName == "mmui::MainWindow",
+                item.BoundingRectangle.width() * item.BoundingRectangle.height(),
+            ),
+        )
+        self._is_electron = self._window.ClassName != "WeChatMainWndForPC"
 
     # ================================================================
     # 控件定位
@@ -116,15 +361,27 @@ class UiaSender(BaseSender):
 
     def _ensure_window(self) -> bool:
         """确保窗口可用"""
-        if not self._ready:
-            return False
         if self._window and self._window.Exists(0.2):
-            return True
+            if (
+                self._window.ClassName != "mmui::MainWindow"
+                or self._mmui_tree_available(self._window)
+            ):
+                self._ready = True
+                return True
+        self._window = None
         self._find_window()
         if not self._window:
             log.warning("微信窗口未找到")
             self._ready = False
             return False
+        log.info(
+            "已重新绑定微信窗口: '%s' ClassName=%s",
+            self._window.Name,
+            self._window.ClassName,
+        )
+        self._last_contact = ""
+        self._reset_input_cache()
+        self._ready = True
         return True
 
     def _get_hwnd(self) -> int:
@@ -268,7 +525,11 @@ class UiaSender(BaseSender):
         ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
         time.sleep(0.3)
 
-    def _switch_contact(self, contact: str) -> bool:
+    def _switch_contact(
+        self,
+        contact: str,
+        is_group: bool | None = None,
+    ) -> bool:
         """
         切换到指定联系人/群聊的聊天窗口。
 
@@ -279,7 +540,7 @@ class UiaSender(BaseSender):
         self._activate()
 
         if self._window.ClassName == "mmui::MainWindow":
-            return self._switch_contact_mmui(contact)
+            return self._switch_contact_mmui(contact, is_group)
 
         try:
             import ctypes
@@ -339,26 +600,34 @@ class UiaSender(BaseSender):
         finally:
             ctypes.windll.user32.AttachThreadInput(CURRENT_TID, WE_CHAT_TID, False)
 
-    def _switch_contact_mmui(self, contact: str) -> bool:
+    def _switch_contact_mmui(
+        self,
+        contact: str,
+        is_group: bool | None = None,
+    ) -> bool:
         """通过微信 4.1 mmui 控件搜索并精确选择会话。"""
-        try:
-            self._auto.SendKeys("{Esc}")
-        except Exception:
-            pass
-        time.sleep(0.2)
-
-        recent_item = self._find_mmui_list_item(
+        recent_items = self._find_mmui_list_items(
             lambda item: (item.AutomationId or "") == f"session_item_{contact}"
         )
-        if recent_item and self._activate_mmui_list_item(recent_item):
-            self._reset_input_cache()
-            if self._wait_mmui_chat_ready():
-                log.info(f"已从会话列表切到联系人: {contact}")
-                return True
-            log.error(f"微信 4.1 会话未成功打开: {contact}")
-            return False
+        for recent_item in recent_items:
+            for attempt in range(2):
+                if not self._activate_mmui_list_item(recent_item):
+                    break
+                self._reset_input_cache()
+                if self._wait_mmui_chat_ready(contact, is_group):
+                    log.info(f"已从会话列表切到联系人: {contact}")
+                    return True
+                if attempt == 0:
+                    log.debug("会话首次打开未就绪，正在重试: %s", contact)
 
         search_box = self._find_search_box_uia()
+        if not search_box:
+            try:
+                self._auto.SendKeys("{Ctrl}f")
+                time.sleep(0.8)
+                search_box = self._find_search_box_uia()
+            except Exception:
+                pass
         if not search_box:
             log.error("微信 4.1 搜索框未找到")
             return False
@@ -375,48 +644,104 @@ class UiaSender(BaseSender):
                 search_box.SendKeys("{Ctrl}v")
             time.sleep(0.8)
 
-            candidate = self._find_mmui_list_item(
+            candidates = self._find_mmui_list_items(
                 lambda item: (
                     (item.Name or "") == contact
                     or (item.Name or "").startswith(f"{contact} ")
                 )
             )
-            if not candidate:
+            if not candidates:
                 log.error(f"微信 4.1 未找到精确会话: {contact}")
                 return False
 
-            if not self._activate_mmui_list_item(candidate):
-                log.error(f"微信 4.1 无法选中会话: {contact}")
-                return False
-            self._reset_input_cache()
-            if not self._wait_mmui_chat_ready():
-                log.error(f"微信 4.1 会话未成功打开: {contact}")
-                return False
-            log.info(f"已切到联系人: {contact}")
-            return True
+            if is_group is None:
+                try:
+                    search_box.SetFocus()
+                    search_box.SendKeys("{Enter}")
+                    self._reset_input_cache()
+                    if self._wait_mmui_chat_ready(
+                        contact,
+                        timeout=3.0,
+                    ):
+                        log.info(f"已通过搜索切到联系人: {contact}")
+                        return True
+                except Exception:
+                    pass
+
+            for candidate in candidates:
+                if not self._activate_mmui_list_item(candidate):
+                    continue
+                self._reset_input_cache()
+                if self._wait_mmui_chat_ready(contact, is_group):
+                    log.info(f"已切到联系人: {contact}")
+                    return True
+            log.error(f"微信 4.1 会话未成功打开: {contact}")
+            return False
         except Exception as exc:
             log.error(f"微信 4.1 切换会话失败: {contact}: {exc}")
             return False
 
     def _find_mmui_list_item(self, predicate):
+        matches = self._find_mmui_list_items(predicate)
+        return matches[0] if matches else None
+
+    def _find_mmui_list_items(self, predicate):
+        return self._find_mmui_controls(
+            lambda control: (
+                control.ControlTypeName == "ListItemControl"
+                and predicate(control)
+            ),
+            max_depth=18,
+        )
+
+    def _find_mmui_control(self, predicate, max_depth: int = 24):
+        matches = self._find_mmui_controls(predicate, max_depth)
+        return matches[0] if matches else None
+
+    def _find_mmui_controls(self, predicate, max_depth: int = 24):
         matches = []
 
         def walk(ctrl, depth=0):
-            if depth > 18 or matches:
+            if depth > max_depth:
                 return
             try:
                 for child in ctrl.GetChildren():
-                    if child.ControlTypeName == "ListItemControl" and predicate(child):
+                    if predicate(child):
                         matches.append(child)
-                        return
                     walk(child, depth + 1)
             except Exception:
                 pass
 
         walk(self._window)
-        return matches[0] if matches else None
+        return matches
+
+    def _current_mmui_is_group(self, contact: str) -> bool | None:
+        title = self._find_mmui_control(
+            lambda control: (
+                control.ControlTypeName == "TextControl"
+                and control.ClassName == "mmui::XHBoxView"
+                and (control.AutomationId or "").endswith(
+                    "big_title_line_h_view"
+                )
+            )
+        )
+        if not title:
+            return None
+        return bool(
+            re.fullmatch(
+                rf"{re.escape(contact)}\(\d+\)",
+                (title.Name or "").strip(),
+            )
+        )
 
     def _activate_mmui_list_item(self, item) -> bool:
+        try:
+            if self._post_mmui_click(item):
+                time.sleep(0.8)
+                return True
+        except Exception:
+            pass
+
         selected = False
         try:
             pattern = item.GetSelectionItemPattern()
@@ -463,25 +788,254 @@ class UiaSender(BaseSender):
             ctypes.windll.user32.SetCursorPos(x, y)
             ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
             ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
-            time.sleep(0.5)
+            time.sleep(0.8)
             return True
         except Exception:
             return selected
+
+    def _post_mmui_click(self, control) -> bool:
+        """向 Qt 主窗口投递点击，兼容已断开的 RDP 会话。"""
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        control_rect = control.BoundingRectangle
+        client_origin = wintypes.POINT(0, 0)
+        if not ctypes.windll.user32.ClientToScreen(
+            hwnd,
+            ctypes.byref(client_origin),
+        ):
+            return False
+        x = int(
+            control_rect.left + control_rect.width() / 2 - client_origin.x
+        )
+        y = int(
+            control_rect.top + control_rect.height() / 2 - client_origin.y
+        )
+        log.debug(
+            "mmui 后台点击: hwnd=%s client=(%s,%s) screen=(%s,%s) "
+            "relative=(%s,%s)",
+            hwnd,
+            client_origin.x,
+            client_origin.y,
+            int(control_rect.left + control_rect.width() / 2),
+            int(control_rect.top + control_rect.height() / 2),
+            x,
+            y,
+        )
+        lparam = (y << 16) | (x & 0xFFFF)
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0200, 0, lparam)
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0201, 0x0001, lparam)
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0202, 0, lparam)
+        return True
+
+    def _post_mmui_key(self, virtual_key: int) -> bool:
+        import ctypes
+
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0100, virtual_key, 0)
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0101, virtual_key, 0)
+        return True
+
+    def _post_mmui_paste(self) -> bool:
+        import ctypes
+
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return False
+        ctypes.windll.user32.SendMessageW(hwnd, 0x0302, 0, 0)
+        return True
+
+    def _ensure_target_contact(
+        self,
+        contact: str,
+        is_group: bool | None = None,
+    ) -> bool:
+        if not self.search_enabled or not contact:
+            return True
+        if contact == self._last_contact:
+            if self._window.ClassName != "mmui::MainWindow":
+                return True
+            if self._wait_mmui_chat_ready(
+                contact,
+                is_group,
+                timeout=0.8,
+            ):
+                return True
+        if not self._switch_contact(contact, is_group):
+            return False
+        self._last_contact = contact
+        return True
+
+    def _get_mmui_session_preview(self, contact: str) -> str:
+        item = self._find_mmui_list_item(
+            lambda control: (
+                (control.AutomationId or "") == f"session_item_{contact}"
+            )
+        )
+        return (item.Name or "") if item else ""
+
+    def _wait_mmui_preview(
+        self,
+        contact: str,
+        expected: str,
+        previous: str,
+        timeout: float = 8.0,
+    ) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            preview = self._get_mmui_session_preview(contact)
+            if expected in preview and preview != previous:
+                return True
+            time.sleep(0.4)
+        return False
+
+    def _send_mmui_image_via_file_dialog(
+        self,
+        contact: str,
+        image_path: str,
+        previous_preview: str,
+    ) -> bool:
+        def find_dialog():
+            matches = []
+
+            def walk(control, depth=0):
+                if depth > 8 or matches:
+                    return
+                try:
+                    if (
+                        control.ClassName == "#32770"
+                        or (control.Name or "").strip()
+                        in {"选择文件", "打开", "Open"}
+                    ):
+                        matches.append(control)
+                        return
+                    for child in control.GetChildren():
+                        walk(child, depth + 1)
+                except Exception:
+                    pass
+
+            walk(self._window)
+            if not matches:
+                walk(self._auto.GetRootControl())
+            return matches[0] if matches else None
+
+        dialog = find_dialog()
+        file_button = self._find_mmui_control(
+            lambda control: (
+                control.ControlTypeName == "ButtonControl"
+                and (control.Name or "").strip() == "发送文件"
+            )
+        )
+        if not dialog and not file_button:
+            log.error("微信 4.1 未找到发送文件按钮")
+            return False
+        if not dialog:
+            if not self._post_mmui_click(file_button):
+                return False
+            deadline = time.time() + 6.0
+            while time.time() < deadline and not dialog:
+                dialog = find_dialog()
+                if not dialog:
+                    time.sleep(0.2)
+        if not dialog:
+            log.error("微信文件选择对话框未出现")
+            return False
+
+        filename_edit = None
+        open_button = None
+
+        def walk(control, depth=0):
+            nonlocal filename_edit, open_button
+            if depth > 14:
+                return
+            try:
+                for child in control.GetChildren():
+                    name = (child.Name or "").strip()
+                    automation_id = child.AutomationId or ""
+                    if child.ControlTypeName == "EditControl" and (
+                        automation_id == "1148"
+                        or name in {"文件名:", "File name:"}
+                    ):
+                        filename_edit = child
+                    if child.ControlTypeName == "ButtonControl" and (
+                        automation_id == "1"
+                        or name in {"打开", "打开(O)", "Open"}
+                    ):
+                        open_button = child
+                    walk(child, depth + 1)
+            except Exception:
+                pass
+
+        walk(dialog)
+        if not filename_edit or not open_button:
+            log.error("微信文件选择对话框控件不完整")
+            return False
+
+        value_pattern = self._get_value_pattern(filename_edit)
+        if not value_pattern:
+            log.error("文件名输入框不支持 ValuePattern")
+            return False
+        value_pattern.SetValue(os.path.abspath(image_path))
+        invoke = open_button.GetInvokePattern()
+        if invoke:
+            invoke.Invoke()
+        else:
+            open_button.Click()
+
+        if self._wait_mmui_preview(
+            contact,
+            "[图片]",
+            previous_preview,
+            timeout=12.0,
+        ):
+            return True
+
+        send_button = self._find_mmui_control(
+            lambda control: (
+                control.ControlTypeName == "ButtonControl"
+                and control.ClassName == "mmui::XOutlineButton"
+                and (control.Name or "").strip() == "发送"
+            )
+        )
+        if send_button and self._post_mmui_click(send_button):
+            return self._wait_mmui_preview(
+                contact,
+                "[图片]",
+                previous_preview,
+                timeout=12.0,
+            )
+        return False
 
     def _reset_input_cache(self) -> None:
         self._input_control = None
         self._send_button = None
         self._use_coord_fallback = False
 
-    def _wait_mmui_chat_ready(self, timeout: float = 3.0) -> bool:
+    def _wait_mmui_chat_ready(
+        self,
+        contact: str = "",
+        is_group: bool | None = None,
+        timeout: float = 5.0,
+    ) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
             ready = []
 
             def walk(ctrl, depth=0):
-                if depth > 16 or ready:
+                if depth > 24 or ready:
                     return
                 try:
+                    automation_id = ctrl.AutomationId or ""
+                    if automation_id == "chat_input_field":
+                        chat_name = (ctrl.Name or "").strip()
+                        if not contact or chat_name == contact:
+                            ready.append(True)
+                            return
                     if ctrl.ClassName == "mmui::ChatPage":
                         children = ctrl.GetChildren()
                         if len(children) > 1 or (
@@ -496,7 +1050,11 @@ class UiaSender(BaseSender):
 
             walk(self._window)
             if ready:
-                return True
+                if is_group is None:
+                    return True
+                current_is_group = self._current_mmui_is_group(contact)
+                if current_is_group is is_group:
+                    return True
             time.sleep(0.2)
         return False
 
@@ -526,7 +1084,7 @@ class UiaSender(BaseSender):
         edits = []
 
         def walk(ctrl, depth=0):
-            if depth > 14:
+            if depth > 24:
                 return
             try:
                 for child in ctrl.GetChildren():
@@ -546,10 +1104,26 @@ class UiaSender(BaseSender):
         except Exception as e:
             log.debug(f"UIA 遍历异常: {e}")
 
+        if not edits and self._window.ClassName == "mmui::MainWindow":
+            log.error("微信 4.1 未暴露聊天输入框，已取消发送")
+            return False
+
         if not edits:
             log.warning("未找到输入控件，使用坐标后备方案（Qt 界面）")
             self._use_coord_fallback = True
             return True
+
+        chat_inputs = [
+            edit
+            for edit in edits
+            if (edit.AutomationId or "") == "chat_input_field"
+            and (
+                not self._last_contact
+                or (edit.Name or "").strip() == self._last_contact
+            )
+        ]
+        if chat_inputs:
+            self._input_control = chat_inputs[0]
 
         # 过滤：聊天输入框在窗口下半部分，面积较大
         candidates = [e for e in edits
@@ -565,6 +1139,8 @@ class UiaSender(BaseSender):
                         e.BoundingRectangle.height(), reverse=True)
 
         for ctrl in candidates:
+            if self._input_control:
+                break
             rect = ctrl.BoundingRectangle
             area = rect.width() * rect.height()
             if area < 200:
@@ -628,7 +1204,12 @@ class UiaSender(BaseSender):
     # 发送方法
     # ================================================================
 
-    def send_text(self, contact: str, text: str) -> bool:
+    def send_text(
+        self,
+        contact: str,
+        text: str,
+        is_group: bool | None = None,
+    ) -> bool:
         """
         发送文本消息
 
@@ -652,18 +1233,19 @@ class UiaSender(BaseSender):
             self._activate()
 
             # 切换到联系人（物理点击搜索框，坐标后备模式下也有效）
-            if self.search_enabled and contact:
-                if contact != self._last_contact:
-                    if not self._switch_contact(contact):
-                        log.error(f"无法自动切换到 '{contact}'，已取消发送")
-                        return False
-                    self._last_contact = contact
+            if not self._ensure_target_contact(contact, is_group):
+                log.error(f"无法自动切换到 '{contact}'，已取消发送")
+                return False
 
             # 定位输入框
             if not self._locate_input():
                 return False
 
             try:
+                previous_preview = ""
+                if self._window.ClassName == "mmui::MainWindow":
+                    previous_preview = self._get_mmui_session_preview(contact)
+
                 if self._use_coord_fallback:
                     # Qt 界面：点击输入框区域→剪贴板粘贴→Enter
                     import pyperclip
@@ -720,11 +1302,25 @@ class UiaSender(BaseSender):
 
                 time.sleep(0.1)
 
-                # 发送
-                if self._send_button:
+                # 微信 4.1 的后台窗口消息不依赖 RDP 桌面保持可见。
+                if self._window.ClassName == "mmui::MainWindow":
+                    ctrl.SetFocus()
+                    if not self._post_mmui_key(0x0D):
+                        raise RuntimeError("无法向微信投递 Enter")
+                elif self._send_button:
                     self._send_button.Click()
                 else:
                     ctrl.SendKeys('{Enter}')
+                if (
+                    self._window.ClassName == "mmui::MainWindow"
+                    and not self._wait_mmui_preview(
+                        contact,
+                        text[:20],
+                        previous_preview,
+                    )
+                ):
+                    log.error(f"[UIA✗] 文本发送后未在会话预览中确认: {contact}")
+                    return False
 
                 log.info(f"[UIA✓] {contact}: {text[:50]}...")
                 return True
@@ -733,7 +1329,12 @@ class UiaSender(BaseSender):
                 log.error(f"[UIA✗] {contact}: {e}")
                 return False
 
-    def send_image(self, contact: str, image_path: str) -> bool:
+    def send_image(
+        self,
+        contact: str,
+        image_path: str,
+        is_group: bool | None = None,
+    ) -> bool:
         """
         通过剪贴板发送图片
 
@@ -753,19 +1354,34 @@ class UiaSender(BaseSender):
                     return False
                 self._activate()
 
-                if self.search_enabled and contact:
-                    if contact != self._last_contact:
-                        if not self._switch_contact(contact):
-                            log.error(f"无法自动切换到 '{contact}'，已取消图片发送")
-                            return False
-                        self._last_contact = contact
-
-                # 复制图片到剪贴板
-                self._copy_image_to_clipboard(image_path)
-                time.sleep(0.2)
+                if not self._ensure_target_contact(contact, is_group):
+                    log.error(f"无法自动切换到 '{contact}'，已取消图片发送")
+                    return False
 
                 if not self._locate_input():
                     return False
+
+                previous_preview = ""
+                if self._window.ClassName == "mmui::MainWindow":
+                    previous_preview = self._get_mmui_session_preview(contact)
+                    if not self._send_mmui_image_via_file_dialog(
+                        contact,
+                        image_path,
+                        previous_preview,
+                    ):
+                        log.error(
+                            f"[UIA✗] 图片发送后未在会话预览中确认: {contact}"
+                        )
+                        return False
+                    log.info(
+                        f"[UIA✓] 图片 → {contact}: "
+                        f"{os.path.basename(image_path)}"
+                    )
+                    return True
+
+                # 旧版微信使用剪贴板粘贴图片。
+                self._copy_image_to_clipboard(image_path)
+                time.sleep(0.2)
 
                 if self._use_coord_fallback:
                     import ctypes

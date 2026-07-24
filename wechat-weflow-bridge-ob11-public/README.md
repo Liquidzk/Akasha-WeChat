@@ -46,6 +46,11 @@ python main.py
 
 **http://127.0.0.1:8766** → 点「基础设置」→ 填写配置 → 保存配置 → 重启生效
 
+微信 4.1 可由 `start-weixin.ps1` 启动。脚本固定使用 Qt 软件渲染，并调用
+`login-weixin.py` 等待已登录主窗口或点击可用的“登录”按钮；需要扫码时仍须人工扫码。
+UIA 发送支持微信缩到系统托盘后自动恢复窗口，图片通过“发送文件”对话框发送，不依赖
+剪贴板。RDP 维护结束前应将 Administrator 会话转到 `console`，避免停留在 `Disc`。
+
 ### 3. 配置 AstrBot
 
 在 AstrBot 中添加 aiocqhttp 适配器（WebUI 或 `cmd_config.json`）：
@@ -120,6 +125,8 @@ wechat-weflow-bridge/
 ├── bridge_core.py       # 桥接核心（缓冲 + SSE + 图片描述）
 ├── web_panel.py         # Web 控制面板（粉白主题 + 在线配置编辑）
 ├── uia_sender.py        # Windows UI Automation 发送器
+├── start-weixin.ps1     # 微信 4.1 软件渲染启动脚本
+├── login-weixin.py      # 已保存登录态的后台登录确认
 ├── config.json          # 配置文件（已 gitignore，需自行创建）
 ├── config.example.json  # 配置示例
 ├── requirements.txt     # Python 依赖

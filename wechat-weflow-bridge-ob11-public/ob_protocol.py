@@ -143,7 +143,12 @@ async def _handle_send_api(action: str, params: dict) -> dict:
             text = str(seg_data.get("text", ""))
             if text:
                 _record_sent_message(text)
-                sent = await asyncio.to_thread(state.sender_instance.send_text, contact, text)
+                sent = await asyncio.to_thread(
+                    state.sender_instance.send_text,
+                    contact,
+                    text,
+                    is_group,
+                )
                 if not sent:
                     return _failed(f"微信文字发送失败: {contact}", 1500)
                 sent_any = True
@@ -156,7 +161,10 @@ async def _handle_send_api(action: str, params: dict) -> dict:
             try:
                 _record_sent_message("[图片]")
                 sent = await asyncio.to_thread(
-                    state.sender_instance.send_image, contact, img_path
+                    state.sender_instance.send_image,
+                    contact,
+                    img_path,
+                    is_group,
                 )
                 if not sent:
                     return _failed(f"微信图片发送失败: {contact}", 1500)
@@ -171,7 +179,10 @@ async def _handle_send_api(action: str, params: dict) -> dict:
         elif seg_type == "face":
             _record_sent_message("[表情]")
             sent = await asyncio.to_thread(
-                state.sender_instance.send_text, contact, "[表情]"
+                state.sender_instance.send_text,
+                contact,
+                "[表情]",
+                is_group,
             )
             if not sent:
                 return _failed(f"微信表情占位发送失败: {contact}", 1500)
