@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+wechat-weflow-bridge-ob11-public/config.json
+wechat-weflow-bridge-ob11-public/bridge.log
+wechat-weflow-bridge-ob11-public/bridge.pid
+wechat-weflow-bridge-ob11-public/data/

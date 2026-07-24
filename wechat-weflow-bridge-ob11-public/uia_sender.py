@@ -127,6 +127,28 @@ class UiaSender(BaseSender):
             return False
         return True
 
+    def _get_hwnd(self) -> int:
+        """获取当前微信主窗口句柄，兼容微信 3.9、4.0 和 4.1。"""
+        try:
+            hwnd = int(self._window.NativeWindowHandle or 0)
+            if hwnd:
+                return hwnd
+        except Exception:
+            pass
+        try:
+            import ctypes
+            for class_name in (
+                "mmui::MainWindow",
+                "Qt51514QWindowIcon",
+                "WeChatMainWndForPC",
+            ):
+                hwnd = ctypes.windll.user32.FindWindowW(class_name, None)
+                if hwnd:
+                    return int(hwnd)
+        except Exception:
+            pass
+        return 0
+
     def _activate(self):
         """激活微信窗口到前台（AttachThreadInput 确保后台也能生效）"""
         try:
@@ -142,9 +164,7 @@ class UiaSender(BaseSender):
         try:
             import ctypes
             from ctypes import wintypes
-            hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-            if not hwnd:
-                hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
+            hwnd = self._get_hwnd()
             if hwnd:
                 WE_CHAT_TID = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, None)
                 CURRENT_TID = ctypes.windll.kernel32.GetCurrentThreadId()
@@ -233,9 +253,7 @@ class UiaSender(BaseSender):
         except ImportError:
             return
 
-        hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-        if not hwnd:
-            hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
+        hwnd = self._get_hwnd()
         if not hwnd:
             return
 
@@ -260,15 +278,16 @@ class UiaSender(BaseSender):
             return False
         self._activate()
 
+        if self._window.ClassName == "mmui::MainWindow":
+            return self._switch_contact_mmui(contact)
+
         try:
             import ctypes
             from ctypes import wintypes
         except ImportError:
             return False
 
-        hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-        if not hwnd:
-            hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
+        hwnd = self._get_hwnd()
         if not hwnd:
             log.warning("找不到微信主窗口句柄")
             return False
@@ -320,6 +339,167 @@ class UiaSender(BaseSender):
         finally:
             ctypes.windll.user32.AttachThreadInput(CURRENT_TID, WE_CHAT_TID, False)
 
+    def _switch_contact_mmui(self, contact: str) -> bool:
+        """通过微信 4.1 mmui 控件搜索并精确选择会话。"""
+        try:
+            self._auto.SendKeys("{Esc}")
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+        recent_item = self._find_mmui_list_item(
+            lambda item: (item.AutomationId or "") == f"session_item_{contact}"
+        )
+        if recent_item and self._activate_mmui_list_item(recent_item):
+            self._reset_input_cache()
+            if self._wait_mmui_chat_ready():
+                log.info(f"已从会话列表切到联系人: {contact}")
+                return True
+            log.error(f"微信 4.1 会话未成功打开: {contact}")
+            return False
+
+        search_box = self._find_search_box_uia()
+        if not search_box:
+            log.error("微信 4.1 搜索框未找到")
+            return False
+
+        try:
+            value_pattern = self._get_value_pattern(search_box)
+            if value_pattern:
+                value_pattern.SetValue(contact)
+            else:
+                import pyperclip
+                search_box.Click()
+                pyperclip.copy(contact)
+                search_box.SendKeys("{Ctrl}a")
+                search_box.SendKeys("{Ctrl}v")
+            time.sleep(0.8)
+
+            candidate = self._find_mmui_list_item(
+                lambda item: (
+                    (item.Name or "") == contact
+                    or (item.Name or "").startswith(f"{contact} ")
+                )
+            )
+            if not candidate:
+                log.error(f"微信 4.1 未找到精确会话: {contact}")
+                return False
+
+            if not self._activate_mmui_list_item(candidate):
+                log.error(f"微信 4.1 无法选中会话: {contact}")
+                return False
+            self._reset_input_cache()
+            if not self._wait_mmui_chat_ready():
+                log.error(f"微信 4.1 会话未成功打开: {contact}")
+                return False
+            log.info(f"已切到联系人: {contact}")
+            return True
+        except Exception as exc:
+            log.error(f"微信 4.1 切换会话失败: {contact}: {exc}")
+            return False
+
+    def _find_mmui_list_item(self, predicate):
+        matches = []
+
+        def walk(ctrl, depth=0):
+            if depth > 18 or matches:
+                return
+            try:
+                for child in ctrl.GetChildren():
+                    if child.ControlTypeName == "ListItemControl" and predicate(child):
+                        matches.append(child)
+                        return
+                    walk(child, depth + 1)
+            except Exception:
+                pass
+
+        walk(self._window)
+        return matches[0] if matches else None
+
+    def _activate_mmui_list_item(self, item) -> bool:
+        selected = False
+        try:
+            pattern = item.GetSelectionItemPattern()
+            if pattern:
+                pattern.Select()
+                time.sleep(0.3)
+                selected = True
+        except Exception:
+            pass
+        try:
+            pattern = item.GetInvokePattern()
+            if pattern:
+                pattern.Invoke()
+                time.sleep(0.5)
+                selected = True
+        except Exception:
+            pass
+        try:
+            pattern = item.GetLegacyIAccessiblePattern()
+            if pattern:
+                pattern.DoDefaultAction()
+                time.sleep(0.5)
+                selected = True
+        except Exception:
+            pass
+        try:
+            item.SetFocus()
+            item.SendKeys("{Enter}")
+            time.sleep(0.5)
+            selected = True
+        except Exception:
+            pass
+        try:
+            item.Click()
+            selected = True
+        except Exception:
+            pass
+        try:
+            import ctypes
+            self._activate()
+            rect = item.BoundingRectangle
+            x = int(rect.left + rect.width() / 2)
+            y = int(rect.top + rect.height() / 2)
+            ctypes.windll.user32.SetCursorPos(x, y)
+            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(0.5)
+            return True
+        except Exception:
+            return selected
+
+    def _reset_input_cache(self) -> None:
+        self._input_control = None
+        self._send_button = None
+        self._use_coord_fallback = False
+
+    def _wait_mmui_chat_ready(self, timeout: float = 3.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ready = []
+
+            def walk(ctrl, depth=0):
+                if depth > 16 or ready:
+                    return
+                try:
+                    if ctrl.ClassName == "mmui::ChatPage":
+                        children = ctrl.GetChildren()
+                        if len(children) > 1 or (
+                            children and children[0].ClassName != "mmui::XIcon"
+                        ):
+                            ready.append(True)
+                            return
+                    for child in ctrl.GetChildren():
+                        walk(child, depth + 1)
+                except Exception:
+                    pass
+
+            walk(self._window)
+            if ready:
+                return True
+            time.sleep(0.2)
+        return False
+
     def _locate_input(self) -> bool:
         """
         定位聊天输入框和发送按钮
@@ -333,8 +513,8 @@ class UiaSender(BaseSender):
         # 如果已有缓存且窗口没变，直接返回
         if self._input_control is not None:
             try:
-                self._input_control.GetCurrentPattern()
-                return True
+                if self._input_control.Exists(0.2):
+                    return True
             except Exception:
                 self._input_control = None
                 self._send_button = None
@@ -391,11 +571,12 @@ class UiaSender(BaseSender):
                 continue
 
             name = ctrl.Name or ""
+            value_pattern = self._get_value_pattern(ctrl)
             log.debug(f"输入候选: '{name[:30]}' {rect.width()}x{rect.height()} "
-                      f"V={ctrl.IsValuePatternAvailable}")
+                      f"V={bool(value_pattern)}")
 
             # 优先使用支持 ValuePattern 的
-            if ctrl.IsValuePatternAvailable:
+            if value_pattern:
                 self._input_control = ctrl
                 log.info(f"聊天输入框: {rect.width()}x{rect.height()} "
                          f"(ValuePattern)")
@@ -436,6 +617,13 @@ class UiaSender(BaseSender):
 
         return True
 
+    @staticmethod
+    def _get_value_pattern(ctrl):
+        try:
+            return ctrl.GetValuePattern()
+        except Exception:
+            return None
+
     # ================================================================
     # 发送方法
     # ================================================================
@@ -467,7 +655,8 @@ class UiaSender(BaseSender):
             if self.search_enabled and contact:
                 if contact != self._last_contact:
                     if not self._switch_contact(contact):
-                        log.warning(f"无法自动切换到 '{contact}'，尝试在当前窗口发送")
+                        log.error(f"无法自动切换到 '{contact}'，已取消发送")
+                        return False
                     self._last_contact = contact
 
             # 定位输入框
@@ -480,9 +669,7 @@ class UiaSender(BaseSender):
                     import pyperclip
                     import ctypes
                     from ctypes import wintypes
-                    hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-                    if not hwnd:
-                        hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
+                    hwnd = self._get_hwnd()
                     if hwnd:
                         rect = wintypes.RECT()
                         ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
@@ -507,14 +694,15 @@ class UiaSender(BaseSender):
                 ctrl = self._input_control
 
                 # 设置文本
-                if ctrl.IsValuePatternAvailable:
+                value_pattern = self._get_value_pattern(ctrl)
+                if value_pattern:
                     try:
-                        ctrl.SetValue("")
+                        value_pattern.SetValue("")
                         time.sleep(0.02)
                     except Exception:
                         pass
                     try:
-                        ctrl.SetValue(text)
+                        value_pattern.SetValue(text)
                     except Exception as e:
                         log.warning(f"SetValue 失败: {e}，尝试剪贴板")
                         import pyperclip
@@ -567,7 +755,9 @@ class UiaSender(BaseSender):
 
                 if self.search_enabled and contact:
                     if contact != self._last_contact:
-                        self._switch_contact(contact)
+                        if not self._switch_contact(contact):
+                            log.error(f"无法自动切换到 '{contact}'，已取消图片发送")
+                            return False
                         self._last_contact = contact
 
                 # 复制图片到剪贴板
@@ -580,9 +770,7 @@ class UiaSender(BaseSender):
                 if self._use_coord_fallback:
                     import ctypes
                     from ctypes import wintypes
-                    hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-                    if not hwnd:
-                        hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
+                    hwnd = self._get_hwnd()
                     if hwnd:
                         rect = wintypes.RECT()
                         ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))

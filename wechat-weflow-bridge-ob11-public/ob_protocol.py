@@ -15,6 +15,7 @@ import os
 import tempfile
 import time
 import logging
+from urllib.parse import unquote, urlparse
 
 import requests
 
@@ -31,101 +32,222 @@ async def _handle_ob_api(data: dict):
     echo = data.get("echo", "")
     log.info(f"[OB11] API: {action} echo={echo}")
 
-    # 先回响应（必须在处理消息前回，否则 AstrBot 超时）
-    resp_sent = False
-    resp_data = {"status": "ok", "retcode": 0, "data": {}}
-    if echo:
-        resp_data["echo"] = echo
-    # 如果 WS 暂时断连，等一会重试
-    for retry in range(10):
-        try:
-            if state._ob_ws:
-                await state._ob_ws.send(json.dumps(resp_data, ensure_ascii=False))
-                resp_sent = True
-                log.info(f"[OB11] 已回响应: {action}")
-                break
-            if retry < 9:
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            log.warning(f"[OB11] 回响应失败 (重试 {retry}/10): {e}")
-            if retry < 9:
-                await asyncio.sleep(0.5)
-    if not resp_sent:
-        log.warning(f"[OB11] 无法回响应（WS 未连接），消息仍尝试本地处理: {action}")
+    try:
+        if action in ("send_msg", "send_private_msg", "send_group_msg"):
+            response = await _handle_send_api(action, params)
+        elif action == "get_login_info":
+            response = _ok({
+                "user_id": state._self_id_int,
+                "nickname": config.BOT_NICKNAMES[0] if config.BOT_NICKNAMES else "微信机器人",
+            })
+        elif action == "get_status":
+            response = _ok({"online": bool(state.running), "good": bool(state._ob_ws_ready.is_set())})
+        elif action == "get_version_info":
+            response = _ok({
+                "app_name": "Akasha-WeChat",
+                "app_version": "2026.07-weflow4",
+                "protocol_version": "v11",
+            })
+        elif action in ("can_send_image", "can_send_record"):
+            response = _ok({"yes": action == "can_send_image"})
+        elif action == "get_group_info":
+            group_id = _as_int(params.get("group_id"))
+            metadata = state.get_route_metadata(group_id)
+            response = _ok({
+                "group_id": group_id,
+                "group_name": metadata.get("display_name", str(group_id)),
+                "member_count": 0,
+                "max_member_count": 0,
+            }) if metadata else _failed("微信群路由不存在", 1404)
+        elif action == "get_group_list":
+            groups = [
+                {
+                    "group_id": group_id,
+                    "group_name": metadata.get("display_name", str(group_id)),
+                    "member_count": 0,
+                    "max_member_count": 0,
+                }
+                for group_id, metadata in state.list_route_metadata("group")
+            ]
+            response = _ok(groups)
+        elif action in ("get_group_member_info", "get_stranger_info"):
+            user_id = _as_int(params.get("user_id"))
+            metadata = state.get_route_metadata(user_id)
+            nickname = metadata.get("display_name", str(user_id)) if metadata else str(user_id)
+            member = {"user_id": user_id, "nickname": nickname, "sex": "unknown", "age": 0}
+            if action == "get_group_member_info":
+                member.update({
+                    "group_id": _as_int(params.get("group_id")),
+                    "card": nickname,
+                    "role": "member",
+                    "title": "",
+                })
+            response = _ok(member)
+        else:
+            response = _failed(f"不支持的 OneBot API: {action}", 1404)
+    except Exception as exc:
+        log.exception(f"[OB11] API 处理异常: {action}")
+        response = _failed(f"OneBot API 处理异常: {exc}", 1500)
 
-    if action in ("send_msg", "send_private_msg", "send_group_msg"):
-        is_group = action == "send_group_msg"
-        target_id = params.get("group_id" if is_group else "user_id", 0)
-        message = params.get("message", [])
-        contact = state._ob_id_to_contact.get(target_id, str(target_id))
+    if echo != "":
+        response["echo"] = echo
+    try:
+        if state._ob_ws:
+            await state._ob_ws.send(json.dumps(response, ensure_ascii=False))
+            log.info(f"[OB11] 已回响应: {action} status={response['status']}")
+        else:
+            log.warning(f"[OB11] 无法回响应（WS 未连接）: {action}")
+    except Exception as exc:
+        log.warning(f"[OB11] 回响应失败: {action}: {exc}")
 
-        # 逐段处理：文字和图片分别发送
-        for seg in message:
-            if not isinstance(seg, dict):
-                continue
-            seg_type = seg.get("type", "")
-            seg_data = seg.get("data", {})
 
-            if seg_type == "text":
-                text = seg_data.get("text", "")
-                if text:
-                    await asyncio.to_thread(state.sender_instance.send_text, contact, text)
-                    log.info(f"[OB11] 文字已发送至 {contact}: {text[:50]}")
-
-            elif seg_type == "image":
-                file_val = seg_data.get("file", "")
-                if not file_val:
-                    continue
-
-                img_path = None
-
-                # AstrBot 通过 aiocqhttp 发图片时用 base64:// 格式
-                if file_val.startswith("base64://"):
-                    try:
-                        # 解码 + 写文件在线程池执行，避免大图卡死事件循环
-                        b64_data = file_val[9:]
-                        img_path = await asyncio.to_thread(_decode_base64_image, b64_data)
-                        if img_path:
-                            log.info(f"[OB11] 图片已解码: {os.path.basename(img_path)}")
-                    except Exception as e:
-                        log.warning(f"[OB11] base64 图片解码失败: {e}")
-                else:
-                    # 文件名模式：在附件目录找
-                    if config.ASTRBOT_ATTACHMENTS:
-                        candidates = [
-                            os.path.join(config.ASTRBOT_ATTACHMENTS, file_val),
-                            os.path.join(config.ASTRBOT_ATTACHMENTS, "wechat_images", file_val),
-                        ]
-                        for p in candidates:
-                            if os.path.exists(p):
-                                img_path = p
-                                break
-                        if not img_path:
-                            log.warning(f"[OB11] 图片文件未找到: {file_val}")
-
-                if img_path:
-                    try:
-                        # 使用线程池执行同步的 UIA 发送，避免阻塞事件循环
-                        await asyncio.to_thread(state.sender_instance.send_image, contact, img_path)
-                        log.info(f"[OB11] 图片已发送至 {contact}")
-                    finally:
-                        # 临时文件用完删除
-                        if img_path and "tmp" in img_path:
-                            try:
-                                os.unlink(img_path)
-                            except Exception:
-                                pass
-
-            elif seg_type == "face":
-                await asyncio.to_thread(state.sender_instance.send_text, contact, "[表情]")
-                log.info(f"[OB11] 表情已发送至 {contact}")
-
-            # 其他类型（record, video 等）忽略
-
+async def _handle_send_api(action: str, params: dict) -> dict:
+    if action == "send_group_msg":
+        is_group = True
+    elif action == "send_private_msg":
+        is_group = False
     else:
-        log.debug(f"[OB11] 未处理 API: {action}")
+        message_type = str(params.get("message_type", "")).lower()
+        is_group = message_type == "group" or (
+            "group_id" in params and "user_id" not in params
+        )
 
-    # 注意：API 响应已在函数开头统一发送，此处不再重复
+    target_key = "group_id" if is_group else "user_id"
+    target_id = _as_int(params.get(target_key))
+    if not target_id:
+        return _failed(f"缺少 {target_key}", 1400)
+
+    contact = state.resolve_contact(target_id)
+    if not contact:
+        metadata = state.get_route_metadata(target_id)
+        if metadata.get("ambiguous"):
+            return _failed("微信会话名称重名，已阻止自动发送", 1409)
+        if metadata.get("sendable") is False:
+            return _failed("WeFlow 未提供可搜索会话名，请配置 contact_overrides", 1409)
+        return _failed(f"未找到微信会话路由: {target_id}", 1404)
+
+    message = params.get("message", [])
+    if isinstance(message, str):
+        message = [{"type": "text", "data": {"text": message}}]
+    if not isinstance(message, list):
+        return _failed("message 格式无效", 1400)
+
+    sent_any = False
+    for seg in message:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = seg.get("type", "")
+        seg_data = seg.get("data", {})
+
+        if seg_type == "text":
+            text = str(seg_data.get("text", ""))
+            if text:
+                _record_sent_message(text)
+                sent = await asyncio.to_thread(state.sender_instance.send_text, contact, text)
+                if not sent:
+                    return _failed(f"微信文字发送失败: {contact}", 1500)
+                sent_any = True
+                log.info(f"[OB11] 文字已发送至 {contact}: {text[:50]}")
+        elif seg_type == "image":
+            file_val = str(seg_data.get("file", ""))
+            img_path, cleanup = await asyncio.to_thread(_resolve_image_file, file_val)
+            if not img_path:
+                return _failed("图片文件不存在或无法读取", 1404)
+            try:
+                _record_sent_message("[图片]")
+                sent = await asyncio.to_thread(
+                    state.sender_instance.send_image, contact, img_path
+                )
+                if not sent:
+                    return _failed(f"微信图片发送失败: {contact}", 1500)
+                sent_any = True
+                log.info(f"[OB11] 图片已发送至 {contact}")
+            finally:
+                if cleanup:
+                    try:
+                        os.unlink(img_path)
+                    except OSError:
+                        pass
+        elif seg_type == "face":
+            _record_sent_message("[表情]")
+            sent = await asyncio.to_thread(
+                state.sender_instance.send_text, contact, "[表情]"
+            )
+            if not sent:
+                return _failed(f"微信表情占位发送失败: {contact}", 1500)
+            sent_any = True
+
+    if not sent_any:
+        return _failed("消息中没有可发送的文字或图片", 1400)
+    return _ok({"message_id": int(time.time() * 1000)})
+
+
+def _ok(payload=None) -> dict:
+    return {"status": "ok", "retcode": 0, "data": {} if payload is None else payload}
+
+
+def _failed(message: str, retcode: int) -> dict:
+    return {
+        "status": "failed",
+        "retcode": retcode,
+        "data": None,
+        "message": message,
+        "wording": message,
+    }
+
+
+def _as_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_sent_message(content: str) -> None:
+    bridge = state.bridge_instance
+    if bridge and hasattr(bridge, "record_sent_message"):
+        bridge.record_sent_message(content)
+
+
+def _resolve_image_file(file_val: str) -> tuple[str | None, bool]:
+    """解析 OneBot 图片来源，返回 (路径, 是否由本函数创建)。"""
+    if not file_val:
+        return None, False
+    if file_val.startswith("base64://"):
+        try:
+            return _decode_base64_image(file_val[9:]), True
+        except (ValueError, OSError):
+            return None, False
+    if file_val.startswith(("http://", "https://")):
+        try:
+            response = requests.get(file_val, timeout=30)
+            response.raise_for_status()
+            suffix = os.path.splitext(urlparse(file_val).path)[1] or ".png"
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+            tmp.write(response.content)
+            tmp.close()
+            return tmp.name, True
+        except requests.RequestException:
+            return None, False
+    if file_val.startswith("file://"):
+        parsed = urlparse(file_val)
+        local_path = unquote(parsed.path)
+        if os.name == "nt" and local_path.startswith("/") and len(local_path) > 2:
+            local_path = local_path[1:]
+        file_val = local_path
+
+    if os.path.isabs(file_val) and os.path.isfile(file_val):
+        return file_val, False
+    candidates = []
+    if config.ASTRBOT_ATTACHMENTS:
+        candidates.extend([
+            os.path.join(config.ASTRBOT_ATTACHMENTS, file_val),
+            os.path.join(config.ASTRBOT_ATTACHMENTS, "wechat_images", file_val),
+        ])
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate, False
+    return None, False
 
 
 def _extract_text(message: list) -> str:

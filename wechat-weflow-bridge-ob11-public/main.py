@@ -26,6 +26,66 @@ log = logging.getLogger("ob11-bridge")
 
 # ============ 启动 / 停止 ============
 
+def _weflow_headers() -> dict:
+    return {"Authorization": f"Bearer {config.ACCESS_TOKEN}"}
+
+
+def _preload_weflow_routes() -> None:
+    """从 WeFlow 会话列表重建主动发送需要的持久化路由。"""
+    try:
+        response = requests.get(
+            f"{config.WE_FLOW_BASE_URL}/api/v1/sessions",
+            params={"limit": 10000},
+            headers=_weflow_headers(),
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        sessions = payload.get("sessions", []) if isinstance(payload, dict) else []
+    except (requests.RequestException, ValueError) as exc:
+        log.warning(f"[路由] 无法预加载 WeFlow 会话: {exc}")
+        return
+
+    names: dict[str, set[str]] = {}
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        session_id = str(session.get("username", "")).strip()
+        display_name = str(
+            session.get("displayName") or session.get("nickname") or ""
+        ).strip()
+        display_name = config.CONTACT_OVERRIDES.get(session_id, display_name)
+        if session_id and display_name:
+            names.setdefault(display_name, set()).add(session_id)
+
+    loaded = 0
+    ambiguous = 0
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        session_id = str(session.get("username", "")).strip()
+        display_name = str(
+            session.get("displayName") or session.get("nickname") or ""
+        ).strip()
+        display_name = config.CONTACT_OVERRIDES.get(session_id, display_name)
+        if not session_id or not display_name:
+            continue
+        session_type = str(session.get("sessionType") or session.get("type") or "")
+        kind = "group" if session_type == "group" or session_id.endswith("@chatroom") else "private"
+        is_ambiguous = len(names.get(display_name, set())) > 1
+        state.register_contact(
+            state._wxid_to_int(session_id),
+            display_name,
+            session_id=session_id,
+            kind=kind,
+            display_name=display_name,
+            ambiguous=is_ambiguous,
+            sendable=display_name != session_id and not display_name.endswith("@chatroom"),
+        )
+        loaded += 1
+        ambiguous += int(is_ambiguous)
+    log.info(f"[路由] 已加载 {loaded} 个 WeFlow 会话，重名会话 {ambiguous} 个")
+
 
 def _start_bridge():
     with state.run_lock:
@@ -97,11 +157,20 @@ def _bridge_loop():
         state.bridge_instance = bridge
 
     try:
-        r = requests.get(f"{config.WE_FLOW_BASE_URL}/api/v1/messages?limit=1&access_token={config.ACCESS_TOKEN}", timeout=5)
+        r = requests.get(
+            f"{config.WE_FLOW_BASE_URL}/api/v1/health",
+            headers=_weflow_headers(),
+            timeout=5,
+        )
         if r.status_code == 200:
             log.info("✅ WeFlow API 正常")
+            _preload_weflow_routes()
         elif r.status_code == 401:
             log.error("❌ Access Token 无效")
+            state.running = False
+            return
+        else:
+            log.error(f"❌ WeFlow API 检查失败: HTTP {r.status_code}")
             state.running = False
             return
     except requests.exceptions.ConnectionError:
@@ -138,6 +207,7 @@ if __name__ == "__main__":
     # 从 config 初始化 state 中需要计算的值
     state._self_id_int = state._wxid_to_int(config.BOT_WXID or "wechat_bot")
     state.group_reply_mode = config.GROUP_REPLY_MODE
+    state.init_route_store(config.ROUTE_MAP_FILE)
 
     PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.pid")
 

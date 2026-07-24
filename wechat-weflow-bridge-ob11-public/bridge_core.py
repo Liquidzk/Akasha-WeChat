@@ -15,8 +15,9 @@ import queue
 import re
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
+from urllib.parse import urljoin
 
 import requests
 
@@ -35,7 +36,7 @@ class WeFlowBridge:
 
     def __init__(self, sender):
         self.sender = sender
-        self.processed_ids = set()
+        self.processed_ids = OrderedDict()
         self.start_timestamp = int(time.time())
         self.pending_buffers = {}
         self.buffer_lock = threading.Lock()
@@ -44,6 +45,7 @@ class WeFlowBridge:
         self._sse_session = None
         self._recent_seen = {}
         self._sent_recently = {}
+        self._sent_lock = threading.Lock()
         self._sse_event_keys = {}
         self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
 
@@ -67,30 +69,55 @@ class WeFlowBridge:
         content = data.get("content", "")
         source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
 
+        now = time.time()
+        if content:
+            with self._sent_lock:
+                sent_at = self._sent_recently.get(content, 0)
+            if now - sent_at < 120:
+                log.info(f"⏭️ 自回复去重跳过: {content[:30]}")
+                return
+
         if content == "[图片]":
-            # 图片消息：下载 → ollama 描述 → 注入缓冲区
-            threading.Thread(target=self.process_image_message,
-                           args=(data,), daemon=True).start()
-            return
+            if config.IMAGE_RECEIVE_MODE == "ignore":
+                log.info("⏭️ 按配置忽略微信图片")
+                return
+            if config.IMAGE_RECEIVE_MODE == "caption":
+                threading.Thread(
+                    target=self.process_image_message,
+                    args=(data,),
+                    daemon=True,
+                ).start()
+                return
+            # 默认只向 AstrBot 传递纯文本占位，不构造 image_url 段。
+            data = dict(data)
+            data["content"] = "[图片]"
+            content = data["content"]
 
         session_id_data = data.get("sessionId", "") or source_name
         group_name_raw = data.get("groupName", "")
         is_group = (data.get("sessionType", "") == "group") or bool(group_name_raw) or "@chatroom" in session_id_data
 
-        now = time.time()
-        if content and content in self._sent_recently and now - self._sent_recently[content] < 120:
-            log.info(f"⏭️ 自回复去重跳过: {content[:30]}")
-            return
-
         sender_in_group = data.get("senderName", "") or data.get("sender", "") or data.get("sourceName", "")
 
         if is_group:
-            if state.group_reply_mode == "mention" and not any(f"@{n}" in content for n in config.BOT_NICKNAMES):
+            is_command = any(content.lstrip().startswith(prefix) for prefix in config.COMMAND_PREFIXES)
+            is_mentioned = any(f"@{n}" in content for n in config.BOT_NICKNAMES)
+            if state.group_reply_mode == "mention" and not is_mentioned and not is_command:
                 return
-            group_raw = group_name_raw or source_name
+            group_raw = (
+                config.CONTACT_OVERRIDES.get(session_id_data)
+                or group_name_raw
+                or source_name
+            )
             base_name = re.sub(r'\s*\(\d+\)\s*$', '', group_raw).strip()
             contact = base_name
         else:
+            is_command = any(
+                content.lstrip().startswith(prefix)
+                for prefix in config.COMMAND_PREFIXES
+            )
+            if config.PRIVATE_REPLY_MODE == "command" and not is_command:
+                return
             contact = source_name
 
         if is_group and state.group_reply_mode == "batch":
@@ -112,6 +139,8 @@ class WeFlowBridge:
                     "source_name": source_name,
                     "group_name": base_name if is_group else "",
                     "sender_in_group": sender_in_group if is_group else "",
+                    "sender_username": data.get("senderUsername", ""),
+                    "sender_id": data.get("senderId", ""),
                     "session_id_data": session_id_data,
                 }
             entry = self.pending_buffers[buffer_key]
@@ -130,6 +159,20 @@ class WeFlowBridge:
                 timer.daemon = True
                 timer.start()
                 entry["timer"] = timer
+
+    def record_sent_message(self, content: str) -> None:
+        """登记桥接刚发出的内容，避免 WeFlow 回推后形成回复循环。"""
+        if not content:
+            return
+        now = time.time()
+        with self._sent_lock:
+            self._sent_recently[content] = now
+            expired = [
+                key for key, timestamp in self._sent_recently.items()
+                if now - timestamp >= 120
+            ]
+            for key in expired:
+                self._sent_recently.pop(key, None)
 
     def process_sender(self, sender_id, version=None):
         """缓冲到期：通过 OneBot 事件推送给 AstrBot。"""
@@ -155,13 +198,19 @@ class WeFlowBridge:
 
         # 构建 OneBot 事件（user_id 要用发言人身份，不能用群 sessionId）
         if is_group:
-            sender_wxid = entry.get("session_id_data", "") + "_" + (entry.get("sender_in_group", "") or entry.get("source_name", ""))
+            sender_wxid = (
+                entry.get("sender_username", "")
+                or entry.get("sender_id", "")
+                or entry.get("session_id_data", "")
+                + "_"
+                + (entry.get("sender_in_group", "") or entry.get("source_name", ""))
+            )
         else:
             sender_wxid = entry.get("session_id_data", sender_id)
         user_id = state._wxid_to_int(sender_wxid)
 
         if is_group:
-            group_id = state._wxid_to_int(entry.get("group_name", contact))
+            group_id = state._wxid_to_int(entry.get("session_id_data", contact))
             sender_name = entry.get("sender_in_group", "") or entry.get("source_name", "未知")
 
             if state.group_reply_mode == "batch":
@@ -176,7 +225,11 @@ class WeFlowBridge:
                         clean_text = clean_text.replace(at_pattern, "").strip()
 
                 formatted = clean_text
-                if sender_name:
+                is_command = any(
+                    clean_text.lstrip().startswith(prefix)
+                    for prefix in config.COMMAND_PREFIXES
+                )
+                if sender_name and not is_command:
                     formatted = f'{sender_name}在群{entry.get("group_name", contact)}中说：{clean_text}'
 
             # 消息段：先 at 机器人（让 aiocqhttp 识别为 @），再发文本
@@ -196,10 +249,36 @@ class WeFlowBridge:
 
         # 记录 user_id → contact 映射，供 API 回复时查找
         if is_group:
-            group_id = state._wxid_to_int(entry.get("group_name", contact))
-            state._ob_id_to_contact[group_id] = contact
+            session_id = entry.get("session_id_data", "")
+            group_id = state._wxid_to_int(session_id or contact)
+            existing = state.get_route_metadata(group_id)
+            state.register_contact(
+                group_id,
+                contact,
+                session_id=session_id,
+                kind="group",
+                display_name=entry.get("group_name", contact),
+                ambiguous=bool(existing.get("ambiguous")),
+                sendable=bool(
+                    config.CONTACT_OVERRIDES.get(session_id)
+                    or (
+                        contact != session_id
+                        and not str(contact).endswith("@chatroom")
+                    )
+                ),
+            )
         else:
-            state._ob_id_to_contact[user_id] = contact
+            session_id = entry.get("session_id_data", "")
+            existing = state.get_route_metadata(user_id)
+            state.register_contact(
+                user_id,
+                contact,
+                session_id=session_id,
+                kind="private",
+                display_name=contact,
+                ambiguous=bool(existing.get("ambiguous")),
+                sendable=True,
+            )
 
         sent = push_event(event)
         if sent > 0:
@@ -213,9 +292,13 @@ class WeFlowBridge:
 
     def listen_sse(self):
         """连接 WeFlow SSE 推送。"""
-        sse_url = f"{config.WE_FLOW_BASE_URL}/api/v1/push/messages?access_token={config.ACCESS_TOKEN}"
+        sse_url = f"{config.WE_FLOW_BASE_URL}/api/v1/push/messages"
         log.info(f"连接 WeFlow 推送服务: {sse_url}")
-        headers = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
+        headers = {
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Authorization": f"Bearer {config.ACCESS_TOKEN}",
+        }
 
         try:
             self._sse_session = requests.get(sse_url, headers=headers, stream=True, timeout=None)
@@ -238,10 +321,16 @@ class WeFlowBridge:
                         msg_time = data.get("timestamp", 0)
                         if msg_time < self.start_timestamp:
                             continue
-                        raw_id = data.get("rawid", "")
-                        if raw_id in self.processed_ids:
+                        dedupe_key = "|".join(
+                            str(data.get(key, ""))
+                            for key in ("event", "rawid", "sessionId", "timestamp")
+                        )
+                        if dedupe_key in self.processed_ids:
                             continue
-                        self.processed_ids.add(raw_id)
+                        self.processed_ids[dedupe_key] = time.time()
+                        self.processed_ids.move_to_end(dedupe_key)
+                        while len(self.processed_ids) > 10000:
+                            self.processed_ids.popitem(last=False)
                         if not self.should_ignore(data):
                             log.info(f"📩 收到: {data.get('sourceName','')} → {data.get('content','')[:50]}")
                             self.add_to_buffer(data)
@@ -255,17 +344,18 @@ class WeFlowBridge:
         finally:
             self._sse_session = None
 
-    def _fetch_wechat_image(self, talker: str) -> str | None:
-        """从 WeFlow REST API 获取最新图片并保存到本地"""
+    def _fetch_wechat_image(self, talker: str, raw_id: str = "") -> str | None:
+        """从 WeFlow REST API 获取指定图片并保存到本地。"""
         try:
             url = f"{config.WE_FLOW_BASE_URL}/api/v1/messages"
             params = {
-                "access_token": config.ACCESS_TOKEN,
                 "talker": talker,
                 "media": "true",
-                "limit": 3,
+                "image": "true",
+                "limit": 20,
             }
-            resp = requests.get(url, params=params, timeout=10)
+            auth_headers = {"Authorization": f"Bearer {config.ACCESS_TOKEN}"}
+            resp = requests.get(url, params=params, headers=auth_headers, timeout=20)
             if resp.status_code != 200:
                 log.error(f"WeFlow 消息API: HTTP {resp.status_code}")
                 return None
@@ -275,13 +365,27 @@ class WeFlowBridge:
             if not isinstance(messages, list):
                 messages = []
 
-            for msg in messages:
-                if msg.get("mediaType") == "image" and msg.get("mediaUrl"):
-                    media_url = msg["mediaUrl"]
-                    sep = "&" if "?" in media_url else "?"
-                    dl_url = f"{media_url}{sep}access_token={config.ACCESS_TOKEN}"
+            image_messages = [
+                msg for msg in messages
+                if msg.get("mediaType") == "image" and msg.get("mediaUrl")
+            ]
+            if raw_id:
+                exact = [
+                    msg for msg in image_messages
+                    if str(msg.get("serverId", "")) == str(raw_id)
+                    or str(msg.get("localId", "")) == str(raw_id)
+                    or str(msg.get("rawid", "")) == str(raw_id)
+                ]
+                if exact:
+                    image_messages = exact
+                else:
+                    log.warning(f"未找到 rawid={raw_id} 对应图片，拒绝使用其他图片")
+                    return None
 
-                    img_resp = requests.get(dl_url, timeout=30)
+            for msg in image_messages:
+                if msg.get("mediaType") == "image" and msg.get("mediaUrl"):
+                    dl_url = urljoin(config.WE_FLOW_BASE_URL, msg["mediaUrl"])
+                    img_resp = requests.get(dl_url, headers=auth_headers, timeout=30)
                     if img_resp.status_code != 200:
                         continue
 
@@ -328,7 +432,7 @@ class WeFlowBridge:
 
         try:
             # 取图 + ollama 描述
-            image_path = self._fetch_wechat_image(session_id)
+            image_path = self._fetch_wechat_image(session_id, rawid)
             caption = None
             if image_path:
                 caption = caption_image_via_ollama(image_path)

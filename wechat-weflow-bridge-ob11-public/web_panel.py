@@ -288,9 +288,13 @@ function renderConfigForm(cfg) {
     {title:'桥接设置', fields:[
       {key:'buffer_seconds', label:'消息缓冲(秒)', type:'number', ph:'5'},
       {key:'group_reply_mode', label:'群聊回复模式', type:'select', opts:[{v:'mention',l:'仅@回复'},{v:'all',l:'全部回复'},{v:'batch',l:'批处理'}]},
+      {key:'private_reply_mode', label:'私聊回复模式', type:'select', opts:[{v:'command',l:'仅指令'},{v:'all',l:'全部回复'}]},
+      {key:'command_prefixes', label:'指令前缀（多个用逗号隔开）', type:'text', ph:'/'},
+      {key:'contact_overrides', label:'会话名覆盖（JSON）', type:'json', ph:'{"123@chatroom":"可搜索群名"}'},
       {key:'web_port', label:'Web 面板端口', type:'number', ph:'8766'},
     ]},
     {title:'图片描述', fields:[
+      {key:'image_receive_mode', label:'接收图片方式', type:'select', opts:[{v:'text',l:'仅文本占位'},{v:'ignore',l:'忽略'},{v:'caption',l:'视觉描述'}]},
       {key:'image_caption_provider', label:'描述服务', type:'select', opts:[{v:'ollama',l:'Ollama 本地'},{v:'openai',l:'OpenAI 兼容'}]},
       {key:'image_caption_model', label:'模型名', type:'text', ph:'kimi-k2.6 / llava:7b'},
       {key:'image_caption_api_key', label:'API Key', type:'password', ph:'sk-xxx (OpenAI模式时)'},
@@ -308,12 +312,13 @@ function renderConfigForm(cfg) {
     g.fields.forEach(function(f){
       var val = cfg[f.key] !== undefined ? cfg[f.key] : '';
       if (Array.isArray(val)) val = val.join(', ');
+      if (f.type === 'json' && typeof val === 'object') val = JSON.stringify(val);
       html += '<div class="settings-field"><label>' + f.label + '</label>';
       if (f.type === 'select') {
         html += '<select id="cfg_' + f.key + '">';
         f.opts.forEach(function(o){html += '<option value="' + o.v + '"' + (val==o.v?' selected':'') + '>' + o.l + '</option>'});
         html += '</select>';
-      } else if (f.type === 'textarea') {
+      } else if (f.type === 'textarea' || f.type === 'json') {
         html += '<textarea id="cfg_' + f.key + '" placeholder="' + (f.ph||'') + '" rows="2">' + val + '</textarea>';
       } else if (f.type === 'number') {
         html += '<input type="number" id="cfg_' + f.key + '" value="' + val + '" placeholder="' + (f.ph||'') + '">';
@@ -339,6 +344,15 @@ function saveConfig() {
     if (el.type === 'number') val = Number(val) || 0;
     // bot_nicknames: 逗号分隔转数组
     if (key === 'bot_nicknames') val = val ? val.split(/[,，]\\s*/).filter(Boolean) : [];
+    if (key === 'command_prefixes') val = val ? val.split(/[,，]\\s*/).filter(Boolean) : [];
+    if (key === 'contact_overrides') {
+      try {
+        val = val ? JSON.parse(val) : {};
+      } catch (e) {
+        showMsg('❌ 会话名覆盖不是有效 JSON');
+        throw e;
+      }
+    }
     data[key] = val;
   });
 

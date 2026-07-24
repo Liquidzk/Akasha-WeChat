@@ -20,6 +20,8 @@
 -  **在线配置编辑** — 直接在网页上修改 config.json，无需碰文件
 -  **消息缓冲** — 多条消息合并后推送，减少 AI 调用次数
 -  **自回复防护** — 多层去重，防止 AI 和自己的消息循环
+-  **稳定会话路由** — 使用 WeFlow `sessionId` 生成 OneBot ID，路由持久化后重启不丢失
+-  **发送失败保护** — 找不到联系人或存在同名会话时拒绝发送，避免误发到当前聊天
 
 ## 前置条件
 
@@ -75,7 +77,12 @@ Web 控制面板：**http://127.0.0.1:8766**
 | `send_method` | 选`"uia"`（UIA 自动化）就好 |
 | `buffer_seconds` | 消息缓冲秒数，多条消息合并后推送 |
 | `group_reply_mode` | `"mention"`（仅@回复）/ `"all"`（全部回复）/ `"batch"`（批处理） |
+| `private_reply_mode` | `"command"` 仅处理私聊指令，`"all"` 处理全部私聊 |
+| `command_prefixes` | 在仅 @ 模式下仍允许直接触发的前缀，例如 `["/"]` |
+| `contact_overrides` | WeFlow 未解析群名时，用 `sessionId: 微信可搜索群名` 手动覆盖 |
+| `route_map_file` | OneBot ID 与微信会话的本地持久化路由文件 |
 | `astrbot_ob_url` | 反向WebSocket 地址 应填 ws/127.0.0.1:11229/ws |
+| `image_receive_mode` | `"text"` 仅传 `[图片]`，`"ignore"` 忽略，`"caption"` 使用视觉模型描述 |
 | `image_caption_provider` | 图片描述服务：`"ollama"` 或 `"openai"` |
 | `image_caption_model` | 视觉模型名，如 `llava:7b` / `kimi-k2.6` |
 
