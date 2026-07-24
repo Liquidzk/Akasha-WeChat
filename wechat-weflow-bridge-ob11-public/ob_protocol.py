@@ -94,7 +94,15 @@ async def _handle_ob_api(data: dict):
     try:
         if state._ob_ws:
             await state._ob_ws.send(json.dumps(response, ensure_ascii=False))
-            log.info(f"[OB11] 已回响应: {action} status={response['status']}")
+            if response["status"] == "ok":
+                log.info(f"[OB11] 已回响应: {action} status=ok")
+            else:
+                log.warning(
+                    "[OB11] 已回响应: %s status=failed retcode=%s message=%s",
+                    action,
+                    response.get("retcode"),
+                    response.get("message", ""),
+                )
         else:
             log.warning(f"[OB11] 无法回响应（WS 未连接）: {action}")
     except Exception as exc:

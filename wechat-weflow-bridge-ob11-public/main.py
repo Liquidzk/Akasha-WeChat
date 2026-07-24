@@ -46,7 +46,7 @@ def _preload_weflow_routes() -> None:
         log.warning(f"[路由] 无法预加载 WeFlow 会话: {exc}")
         return
 
-    names: dict[str, set[str]] = {}
+    names: dict[tuple[str, str], set[str]] = {}
     for session in sessions:
         if not isinstance(session, dict):
             continue
@@ -56,7 +56,16 @@ def _preload_weflow_routes() -> None:
         ).strip()
         display_name = config.CONTACT_OVERRIDES.get(session_id, display_name)
         if session_id and display_name:
-            names.setdefault(display_name, set()).add(session_id)
+            session_type = str(
+                session.get("sessionType") or session.get("type") or ""
+            )
+            kind = (
+                "group"
+                if session_type == "group"
+                or session_id.endswith("@chatroom")
+                else "private"
+            )
+            names.setdefault((display_name, kind), set()).add(session_id)
 
     loaded = 0
     ambiguous = 0
@@ -72,7 +81,7 @@ def _preload_weflow_routes() -> None:
             continue
         session_type = str(session.get("sessionType") or session.get("type") or "")
         kind = "group" if session_type == "group" or session_id.endswith("@chatroom") else "private"
-        is_ambiguous = len(names.get(display_name, set())) > 1
+        is_ambiguous = len(names.get((display_name, kind), set())) > 1
         state.register_contact(
             state._wxid_to_int(session_id),
             display_name,

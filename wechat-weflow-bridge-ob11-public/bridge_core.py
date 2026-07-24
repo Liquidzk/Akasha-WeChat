@@ -30,6 +30,18 @@ log = logging.getLogger("ob11-bridge")
 
 # ============ 桥接核心 ============
 
+def _route_name_is_ambiguous(
+    kind: str,
+    route_id: int,
+    contact: str,
+) -> bool:
+    """只在同类型会话内判断重名，群聊和私聊由发送器二次校验。"""
+    return any(
+        other_id != route_id
+        and metadata.get("contact") == contact
+        for other_id, metadata in state.list_route_metadata(kind)
+    )
+
 
 class WeFlowBridge:
     """WeFlow ↔ AstrBot 桥接器（OneBot v11 版）。"""
@@ -251,14 +263,17 @@ class WeFlowBridge:
         if is_group:
             session_id = entry.get("session_id_data", "")
             group_id = state._wxid_to_int(session_id or contact)
-            existing = state.get_route_metadata(group_id)
             state.register_contact(
                 group_id,
                 contact,
                 session_id=session_id,
                 kind="group",
                 display_name=entry.get("group_name", contact),
-                ambiguous=bool(existing.get("ambiguous")),
+                ambiguous=_route_name_is_ambiguous(
+                    "group",
+                    group_id,
+                    contact,
+                ),
                 sendable=bool(
                     config.CONTACT_OVERRIDES.get(session_id)
                     or (
@@ -269,14 +284,17 @@ class WeFlowBridge:
             )
         else:
             session_id = entry.get("session_id_data", "")
-            existing = state.get_route_metadata(user_id)
             state.register_contact(
                 user_id,
                 contact,
                 session_id=session_id,
                 kind="private",
                 display_name=contact,
-                ambiguous=bool(existing.get("ambiguous")),
+                ambiguous=_route_name_is_ambiguous(
+                    "private",
+                    user_id,
+                    contact,
+                ),
                 sendable=True,
             )
 
