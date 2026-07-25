@@ -64,6 +64,9 @@ python main.py
 ```
 
 Web 控制面板：**http://127.0.0.1:8766**
+
+`start-weflow.ps1` 可作为计划任务入口守护 WeFlow。WeFlow 主进程退出后会
+自动重新启动，避免中继长期停在 `weflow_connected=false`。
 - 打开web控制面板 → 点「基础设置」→ 填写配置 → 保存配置 → 重启生效
 ## 配置项说明
 
